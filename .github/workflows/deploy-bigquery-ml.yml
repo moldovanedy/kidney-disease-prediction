@@ -1,0 +1,51 @@
+name: Train and deploy BigQuery ML model
+
+on:
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+    id-token: write
+
+concurrency:
+    group: bigquery-ml-deploy
+    cancel-in-progress: false
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Check out source
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.14"
+                  cache: pip
+
+            - name: Install app and test dependencies
+              run: python -m pip install -e ".[test]"
+
+            - name: Validate data contract
+              run: pytest
+
+            - name: Train and export TensorFlow model
+              run: python -m kidney_predictor.train
+
+            - name: Authenticate to Google Cloud
+              uses: google-github-actions/auth@v2
+              with:
+                  workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+                  service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+            - name: Upload model and register in BigQuery ML
+              env:
+                  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+                  GCP_BUCKET: ${{ vars.GCP_BUCKET }}
+                  BQ_DATASET: ${{ vars.BQ_DATASET }}
+                  BQ_MODEL: ${{ vars.BQ_MODEL }}
+                  BQ_LOCATION: ${{ vars.BQ_LOCATION }}
+              run: python -m kidney_predictor.deploy
