@@ -20,8 +20,13 @@ def main() -> None:
     location = os.getenv("BQ_LOCATION") or "US"
     deployment_id = os.getenv("GITHUB_SHA", "manual")
     model_dir = Path(os.getenv("MODEL_DIR", "artifacts/saved_model"))
+    importance_path = Path(
+        os.getenv("FEATURE_IMPORTANCE_PATH", "artifacts/feature_importance.csv")
+    )
     if not (model_dir / "saved_model.pb").is_file():
         raise FileNotFoundError(f"No SavedModel found at {model_dir}")
+    if not importance_path.is_file():
+        raise FileNotFoundError(f"No feature importance file found at {importance_path}")
 
     object_prefix = f"kidney-predictor/{deployment_id}/saved_model"
     storage_client = storage.Client(project=project)
@@ -39,7 +44,28 @@ def main() -> None:
         f"MODEL_PATH = '{model_path}')"
     )
     bigquery_client.query(statement).result()
+
+    importance_table = f"{project}.{dataset_id}.{model_id}_feature_importance"
+    importance_job = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.CSV,
+        skip_leading_rows=1,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=[
+            bigquery.SchemaField("factor", "STRING"),
+            bigquery.SchemaField("reference_value", "STRING"),
+            bigquery.SchemaField("mean_absolute_probability_change", "FLOAT"),
+            bigquery.SchemaField("mean_probability_change_to_reference", "FLOAT"),
+        ],
+    )
+    with importance_path.open("rb") as importance_file:
+        bigquery_client.load_table_from_file(
+            importance_file,
+            importance_table,
+            job_config=importance_job,
+        ).result()
+
     print(f"Registered BigQuery ML model `{project}.{dataset_id}.{model_id}`")
+    print(f"Loaded model-derived factor importance into `{importance_table}`")
 
 
 if __name__ == "__main__":

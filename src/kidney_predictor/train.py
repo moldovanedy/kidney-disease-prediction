@@ -1,9 +1,16 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import tensorflow as tf
 
-from kidney_predictor.schema import MODEL_FEATURE_COLUMNS, read_training_data
+from kidney_predictor.schema import (
+    CATEGORICAL_VALUES,
+    MODEL_FEATURE_COLUMNS,
+    NUMERIC_FEATURE_COLUMNS,
+    read_training_data,
+)
 
 
 class SavedModelPredictor(tf.Module):
@@ -23,7 +30,57 @@ class SavedModelPredictor(tf.Module):
     )
     def serve(self, features: tf.Tensor) -> dict[str, tf.Tensor]:
         features = tf.where(tf.math.is_finite(features), features, self.medians)
-        return {"probability": self.classifier(features)}
+        return {"probability": tf.squeeze(self.classifier(features), axis=-1)}
+
+
+def write_feature_importance(
+    classifier: tf.keras.Model,
+    features: pd.DataFrame,
+    values: np.ndarray,
+    medians: np.ndarray,
+    output_path: Path,
+) -> None:
+    baseline_probabilities = classifier(values, training=False).numpy().reshape(-1)
+    feature_groups = {column: [column] for column in NUMERIC_FEATURE_COLUMNS}
+    feature_groups.update(
+        {
+            column: [
+                feature_name
+                for feature_name in MODEL_FEATURE_COLUMNS
+                if feature_name.startswith(f"{column}=")
+            ]
+            for column in CATEGORICAL_VALUES
+        }
+    )
+
+    importance_rows = []
+    for factor, encoded_features in feature_groups.items():
+        feature_indices = [MODEL_FEATURE_COLUMNS.index(name) for name in encoded_features]
+        reference_values = values.copy()
+        if factor in NUMERIC_FEATURE_COLUMNS:
+            reference = float(medians[feature_indices[0]])
+            reference_values[:, feature_indices[0]] = reference
+            reference_label = str(reference)
+        else:
+            category_frequencies = features[encoded_features].mean(axis=0).to_numpy()
+            reference_index = int(np.argmax(category_frequencies))
+            reference_values[:, feature_indices] = 0.0
+            reference_values[:, feature_indices[reference_index]] = 1.0
+            reference_label = encoded_features[reference_index].split("=", 1)[1]
+
+        reference_probabilities = classifier(reference_values, training=False).numpy().reshape(-1)
+        probability_changes = reference_probabilities - baseline_probabilities
+        importance_rows.append(
+            {
+                "factor": factor,
+                "reference_value": reference_label,
+                "mean_absolute_probability_change": float(np.mean(np.abs(probability_changes))),
+                "mean_probability_change_to_reference": float(np.mean(probability_changes)),
+            }
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(importance_rows).to_csv(output_path, index=False)
 
 
 def train(csv_path: Path, output_dir: Path, epochs: int) -> None:
@@ -50,6 +107,13 @@ def train(csv_path: Path, output_dir: Path, epochs: int) -> None:
         predictor,
         str(output_dir),
         signatures={"serving_default": predictor.serve},
+    )
+    write_feature_importance(
+        classifier,
+        features,
+        values.numpy(),
+        medians.numpy(),
+        output_dir.parent / "feature_importance.csv",
     )
     print(f"Saved TensorFlow model to {output_dir}")
 

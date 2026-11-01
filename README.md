@@ -78,10 +78,18 @@ gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/bigquery.jobUser"
 
-bq add-iam-policy-binding \
+(bq add-iam-policy-binding \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/bigquery.dataEditor" \
-  "${GCP_PROJECT_ID}:${BQ_DATASET}"
+  "${GCP_PROJECT_ID}:${BQ_DATASET}")
+
+OR
+
+(bq show --format=prettyjson "${GCP_PROJECT_ID}:${BQ_DATASET}" \
+  | jq --arg sa "${SA_EMAIL}" \
+      '.access += [{"role":"WRITER","userByEmail":$sa}]' \
+  > /tmp/dataset_updated.json
+bq update --source /tmp/dataset_updated.json "${GCP_PROJECT_ID}:${BQ_DATASET}")
 
 gcloud storage buckets add-iam-policy-binding "gs://${GCP_BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
@@ -92,20 +100,24 @@ The service account can now run BigQuery jobs, replace models in this dataset, a
 
 ### 5. Allow BigQuery to read the uploaded model
 
-BigQuery reads the SavedModel from Cloud Storage using its project service agent, not the GitHub deployment identity. Enable the BigQuery service identity and grant it read-only access to the bucket:
+BigQuery reads the SavedModel from Cloud Storage using its project service agent, not the GitHub deployment identity. This is a Google-managed account, so you do not create it in the service-account page. First confirm `PROJECT_NUMBER` is set to the numeric project number (not the project ID), then run the identity command. Its output includes the service-agent email:
 
 ```bash
+echo "$PROJECT_NUMBER"
+
 gcloud beta services identity create \
   --service=bigquery.googleapis.com \
   --project="$GCP_PROJECT_ID"
 
 export BIGQUERY_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-bigquery.iam.gserviceaccount.com"
+echo "$BIGQUERY_SERVICE_AGENT"
+
 gcloud storage buckets add-iam-policy-binding "gs://${GCP_BUCKET}" \
   --member="serviceAccount:${BIGQUERY_SERVICE_AGENT}" \
   --role="roles/storage.objectViewer"
 ```
 
-If your installed `gcloud` has no `beta` component, enable the BigQuery API first and use the service agent shown under **IAM & Admin > IAM > Google-managed service accounts**. The address normally has the form used above.
+If the identity command fails, make sure step 2 completed successfully and that `GCP_PROJECT_ID` names the intended project. Re-read the project number with `gcloud projects describe "$GCP_PROJECT_ID" --format='value(projectNumber)'`. If your installed `gcloud` has no `beta` component, install/enable the Cloud SDK beta component or use the Google Cloud Console's **IAM & Admin > IAM** page with Google-managed service accounts visible; the expected account is `service-PROJECT_NUMBER@gcp-sa-bigquery.iam.gserviceaccount.com`. If not, replace with one that exists.
 
 ### 6. Configure GitHub Workload Identity Federation
 
@@ -158,15 +170,130 @@ In GitHub, open **Settings > Secrets and variables > Actions > Variables**, then
 
 Commit and push the reviewed changes to the repository's `main` branch. In GitHub, open **Actions > Train and deploy BigQuery ML** and confirm the latest run succeeds. You can also select **Run workflow**, choosing `main` as the branch. Each successful run uploads to `gs://<bucket>/kidney-predictor/<commit>/saved_model/` and creates or replaces `${GCP_PROJECT_ID}.${BQ_DATASET}.${BQ_MODEL}`.
 
-To verify the model exists, run this in BigQuery Studio (substitute your project, dataset, and model IDs):
+### Score rows and rank factors in BigQuery
+
+Load the bundled CSV into a BigQuery input table. Substitute your project and dataset IDs:
+
+```bash
+bq load --autodetect --replace --source_format=CSV --skip_leading_rows=1 \
+  your-project:kidney_prediction.kidney_input \
+  data/sample_kidney_data.csv
+```
+
+Run the following in BigQuery Studio after deployment. It encodes the categorical columns in the SavedModel's 54-value input order and reads numeric medians from the table published by the training job. Replace the three-part table names with your project, dataset, and configured model IDs:
 
 ```sql
-SELECT *
+WITH medians AS (
+  SELECT
+    MAX(IF(factor = 'age', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS age,
+    MAX(IF(factor = 'bp', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS bp,
+    MAX(IF(factor = 'sg', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS sg,
+    MAX(IF(factor = 'al', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS al,
+    MAX(IF(factor = 'su', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS su,
+    MAX(IF(factor = 'bgr', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS bgr,
+    MAX(IF(factor = 'bu', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS bu,
+    MAX(IF(factor = 'sc', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS sc,
+    MAX(IF(factor = 'sod', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS sod,
+    MAX(IF(factor = 'pot', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS pot,
+    MAX(IF(factor = 'hemo', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS hemo,
+    MAX(IF(factor = 'pcv', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS pcv,
+    MAX(IF(factor = 'wc', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS wc,
+    MAX(IF(factor = 'rc', SAFE_CAST(reference_value AS FLOAT64), NULL)) AS rc
+  FROM `your-project.kidney_prediction.kidney_logistic_regression_feature_importance`
+), cleaned AS (
+  SELECT
+    *,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(rbc AS STRING))), ''), '?') AS rbc_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(pc AS STRING))), ''), '?') AS pc_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(pcc AS STRING))), ''), '?') AS pcc_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(ba AS STRING))), ''), '?') AS ba_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(htn AS STRING))), ''), '?') AS htn_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(dm AS STRING))), ''), '?') AS dm_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(cad AS STRING))), ''), '?') AS cad_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(appet AS STRING))), ''), '?') AS appet_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(pe AS STRING))), ''), '?') AS pe_value,
+    NULLIF(NULLIF(LOWER(TRIM(CAST(ane AS STRING))), ''), '?') AS ane_value
+  FROM `your-project.kidney_prediction.kidney_input`
+), encoded AS (
+  SELECT
+    c.id,
+    ARRAY<FLOAT64>[
+      COALESCE(SAFE_CAST(c.age AS FLOAT64), m.age),
+      COALESCE(SAFE_CAST(c.bp AS FLOAT64), m.bp),
+      COALESCE(SAFE_CAST(c.sg AS FLOAT64), m.sg),
+      COALESCE(SAFE_CAST(c.al AS FLOAT64), m.al),
+      COALESCE(SAFE_CAST(c.su AS FLOAT64), m.su),
+      COALESCE(SAFE_CAST(c.bgr AS FLOAT64), m.bgr),
+      COALESCE(SAFE_CAST(c.bu AS FLOAT64), m.bu),
+      COALESCE(SAFE_CAST(c.sc AS FLOAT64), m.sc),
+      COALESCE(SAFE_CAST(c.sod AS FLOAT64), m.sod),
+      COALESCE(SAFE_CAST(c.pot AS FLOAT64), m.pot),
+      COALESCE(SAFE_CAST(c.hemo AS FLOAT64), m.hemo),
+      COALESCE(SAFE_CAST(c.pcv AS FLOAT64), m.pcv),
+      COALESCE(SAFE_CAST(c.wc AS FLOAT64), m.wc),
+      COALESCE(SAFE_CAST(c.rc AS FLOAT64), m.rc),
+      IF(c.rbc_value = 'normal', 1.0, 0.0),
+      IF(c.rbc_value = 'abnormal', 1.0, 0.0),
+      IF(c.rbc_value IS NULL, 1.0, 0.0),
+      IF(c.rbc_value IS NOT NULL AND c.rbc_value NOT IN ('normal', 'abnormal'), 1.0, 0.0),
+      IF(c.pc_value = 'normal', 1.0, 0.0),
+      IF(c.pc_value = 'abnormal', 1.0, 0.0),
+      IF(c.pc_value IS NULL, 1.0, 0.0),
+      IF(c.pc_value IS NOT NULL AND c.pc_value NOT IN ('normal', 'abnormal'), 1.0, 0.0),
+      IF(c.pcc_value = 'present', 1.0, 0.0),
+      IF(c.pcc_value = 'notpresent', 1.0, 0.0),
+      IF(c.pcc_value IS NULL, 1.0, 0.0),
+      IF(c.pcc_value IS NOT NULL AND c.pcc_value NOT IN ('present', 'notpresent'), 1.0, 0.0),
+      IF(c.ba_value = 'present', 1.0, 0.0),
+      IF(c.ba_value = 'notpresent', 1.0, 0.0),
+      IF(c.ba_value IS NULL, 1.0, 0.0),
+      IF(c.ba_value IS NOT NULL AND c.ba_value NOT IN ('present', 'notpresent'), 1.0, 0.0),
+      IF(c.htn_value = 'yes', 1.0, 0.0),
+      IF(c.htn_value = 'no', 1.0, 0.0),
+      IF(c.htn_value IS NULL, 1.0, 0.0),
+      IF(c.htn_value IS NOT NULL AND c.htn_value NOT IN ('yes', 'no'), 1.0, 0.0),
+      IF(c.dm_value = 'yes', 1.0, 0.0),
+      IF(c.dm_value = 'no', 1.0, 0.0),
+      IF(c.dm_value IS NULL, 1.0, 0.0),
+      IF(c.dm_value IS NOT NULL AND c.dm_value NOT IN ('yes', 'no'), 1.0, 0.0),
+      IF(c.cad_value = 'yes', 1.0, 0.0),
+      IF(c.cad_value = 'no', 1.0, 0.0),
+      IF(c.cad_value IS NULL, 1.0, 0.0),
+      IF(c.cad_value IS NOT NULL AND c.cad_value NOT IN ('yes', 'no'), 1.0, 0.0),
+      IF(c.appet_value = 'good', 1.0, 0.0),
+      IF(c.appet_value = 'poor', 1.0, 0.0),
+      IF(c.appet_value IS NULL, 1.0, 0.0),
+      IF(c.appet_value IS NOT NULL AND c.appet_value NOT IN ('good', 'poor'), 1.0, 0.0),
+      IF(c.pe_value = 'yes', 1.0, 0.0),
+      IF(c.pe_value = 'no', 1.0, 0.0),
+      IF(c.pe_value IS NULL, 1.0, 0.0),
+      IF(c.pe_value IS NOT NULL AND c.pe_value NOT IN ('yes', 'no'), 1.0, 0.0),
+      IF(c.ane_value = 'yes', 1.0, 0.0),
+      IF(c.ane_value = 'no', 1.0, 0.0),
+      IF(c.ane_value IS NULL, 1.0, 0.0),
+      IF(c.ane_value IS NOT NULL AND c.ane_value NOT IN ('yes', 'no'), 1.0, 0.0)
+    ] AS features
+  FROM cleaned AS c
+  CROSS JOIN medians AS m
+)
+SELECT id, probability AS ckd_risk_probability
 FROM ML.PREDICT(
-  MODEL `your-project.your_dataset.kidney_logistic_regression`,
-  (SELECT ARRAY<FLOAT64>[/* 54 preprocessed values, in MODEL_FEATURE_COLUMNS order */]
-   AS features)
+  MODEL `your-project.kidney_prediction.kidney_logistic_regression`,
+  (SELECT id, features FROM encoded)
 );
 ```
 
-The `features` array contains the 14 numeric values followed by one-hot values for each categorical field, in `MODEL_FEATURE_COLUMNS` order. Missing numeric entries can be passed as `CAST('NaN' AS FLOAT64)` and are imputed by the model. This is a software template, not a validated medical model or a clinical decision tool.
+`ckd_risk_probability` is the model's estimated probability for the positive `ckd` class. The training job also writes model-derived, global factor impact values to `<BQ_MODEL>_feature_importance`. The impact compares each training row's probability with the model's probability after that factor is replaced by its training median (numeric) or most frequent category (categorical). Query the largest impacts with:
+
+```sql
+SELECT
+  factor,
+  reference_value,
+  ROUND(mean_absolute_probability_change * 100, 2) AS mean_absolute_change_percentage_points,
+  ROUND(mean_probability_change_to_reference * 100, 2) AS mean_signed_change_percentage_points
+FROM `your-project.kidney_prediction.kidney_logistic_regression_feature_importance`
+ORDER BY mean_absolute_probability_change DESC
+LIMIT 10;
+```
+
+These are model/data-dependent associations, not causal effects or clinical advice. The bundled data is only a software example; this model has not been validated for clinical use.
