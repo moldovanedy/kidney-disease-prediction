@@ -22,6 +22,11 @@ def test_training_exports_model_and_learned_factor_importance(tmp_path: Path) ->
     assert importance["mean_absolute_probability_change"].nunique() > 1
 
     features, _ = read_training_data(csv_path)
+    checkpoint = tf.train.list_variables(str(model_path / "variables" / "variables"))
+    checkpoint_shapes = {tuple(shape) for _, shape in checkpoint}
+    assert (features.shape[1], 1) in checkpoint_shapes
+    assert (features.shape[1], 64) not in checkpoint_shapes
+
     predictor = tf.saved_model.load(str(model_path)).signatures["serving_default"]
     predictions = predictor(
         features=tf.convert_to_tensor(features.to_numpy(dtype=np.float32))

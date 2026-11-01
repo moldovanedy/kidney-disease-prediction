@@ -1,6 +1,6 @@
 # Kidney disease prediction template
 
-A small Python app that trains a TensorFlow binary logistic-regression model, emits a probability for each input row, and can register its SavedModel in BigQuery ML.
+A small Python app that trains a regularized TensorFlow logistic-regression model with a single output node, emits a probability for each input row, and can register its SavedModel in BigQuery ML.
 
 ## Local use
 
